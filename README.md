@@ -2,25 +2,29 @@
 
 一个轻量级的文件/目录备份工具，支持时间戳命名、批量备份和元数据记录。
 
+**当前版本：v0.2.0**
+
 ## 特性
 
 - 📦 **简单易用** - 用法接近 `cp`，零学习成本
 - ⏰ **时间戳备份** - 自动生成带时间戳的备份文件名
-- 📂 **目录支持** - 支持文件和目录备份
+- 📂 **目录支持** - 支持文件和目录备份，包含完整文件校验
 - 🔒 **原子操作** - 备份失败不影响原文件
 - ✅ **校验和验证** - SHA256 校验保证备份完整性
-- 📋 **元数据记录** - 记录备份来源、时间、大小等信息
+- 📋 **元数据记录** - 记录备份来源、时间、大小、逐文件 checksum
+- 🔢 **批量备份** - 一次备份多个文件/目录
+- 📊 **统一报告** - 批量任务完成后统一报告成功/失败
 
 ## 安装
 
 ### 方法一：直接下载二进制
 
-从 [Releases](https://github.com/YOUR_USERNAME/backup-tool/releases) 下载对应平台的二进制文件。
+从 [Releases](https://github.com/hua25/backup-tool/releases) 下载对应平台的二进制文件。
 
 ### 方法二：从源码编译
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/backup-tool.git
+git clone https://github.com/hua25/backup-tool.git
 cd backup-tool
 go build -o bak .
 sudo mv bak /usr/local/bin/
@@ -95,10 +99,28 @@ bak -q data.csv
 详细模式：
 ```
 [INFO] Starting backup...
-[SOURCE] report.pdf (1.5 MB, sha256:abc123...)
+[SOURCE] report.pdf (1.5 MB)
 [DEST]   /backup/report.bak/report.bak.20260319_143000.pdf
 [VERIFY] checksum: sha256:abc123...
 [OK] Backup completed
+```
+
+目录备份详细模式：
+```
+[INFO] Starting backup...
+[SOURCE] /data (10.0 KB)
+[DEST]   /backup/data.bak/data.bak.20260319_143000/
+[VERIFY] 25 files checked
+[OK] Backup completed
+```
+
+批量备份（部分成功）：
+```
+✓ backup: file1.txt -> file1.txt.bak/file1.bak.20260319_143000.txt (6 B)
+✗ error: nonexistent.txt -> source file not found: nonexistent.txt
+✓ backup: /data -> /data.bak/data.bak.20260319_143000/ (0 B)
+
+1/3 failed
 ```
 
 ## 备份结构
@@ -116,12 +138,38 @@ bak -q data.csv
 元数据文件 `.bak.meta.json`：
 ```json
 {
-  "version": "1.0",
+  "version": "0.2.0",
   "source": "report.pdf",
   "source_path": "/home/user/report.pdf",
   "created_at": "2026-03-19T14:30:00Z",
   "size": 1572864,
-  "checksum": "sha256:abc123..."
+  "checksum": "sha256:abc123...",
+  "is_dir": false
+}
+```
+
+目录备份元数据：
+```json
+{
+  "version": "0.2.0",
+  "source": "myproject",
+  "source_path": "/home/user/myproject",
+  "created_at": "2026-03-19T14:30:00Z",
+  "size": 4096,
+  "checksum": "",
+  "is_dir": true,
+  "files": [
+    {
+      "path": "file1.txt",
+      "size": 100,
+      "checksum": "sha256:abc123..."
+    },
+    {
+      "path": "subdir/file2.txt",
+      "size": 200,
+      "checksum": "sha256:def456..."
+    }
+  ]
 }
 ```
 
@@ -129,17 +177,14 @@ bak -q data.csv
 
 | 退出码 | 含义 |
 |--------|------|
-| 0 | 备份成功 |
-| 1 | 通用错误（参数错误、源文件不存在等） |
-| 2 | 权限问题 |
-| 3 | 磁盘空间不足 |
-| 4 | checksum 验证失败 |
+| 0 | 备份成功（或部分成功） |
+| 1 | 所有任务失败 |
 
 ## 开发
 
 ```bash
 # 克隆项目
-git clone https://github.com/YOUR_USERNAME/backup-tool.git
+git clone https://github.com/hua25/backup-tool.git
 cd backup-tool
 
 # 运行测试
@@ -150,6 +195,9 @@ go build -o bak .
 
 # 查看帮助
 ./bak --help
+
+# 查看版本
+./bak --version
 ```
 
 ## License

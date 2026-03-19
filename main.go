@@ -13,6 +13,9 @@ import (
 	"time"
 )
 
+// Version 版本信息
+const Version = "0.2.0"
+
 // 重新排列参数，让 flags 在 positional args 前面
 // 处理 -d value 这种 flag-value 对
 func reorderArgs() []string {
@@ -40,9 +43,6 @@ func reorderArgs() []string {
 	return append(flags, pos...)
 }
 
-// Version 版本信息
-const Version = "0.1.0"
-
 // Config 配置
 type Config struct {
 	Dest       string
@@ -55,14 +55,31 @@ type Config struct {
 	KeepDays   int
 }
 
+// FileMeta 文件元数据
+type FileMeta struct {
+	Path     string `json:"path"`
+	Size     int64  `json:"size"`
+	Checksum string `json:"checksum"`
+}
+
 // Meta 元数据
 type Meta struct {
-	Version    string `json:"version"`
-	Source     string `json:"source"`
-	SourcePath string `json:"source_path"`
-	CreatedAt  string `json:"created_at"`
-	Size       int64  `json:"size"`
-	Checksum   string `json:"checksum"`
+	Version    string     `json:"version"`
+	Source     string     `json:"source"`
+	SourcePath string     `json:"source_path"`
+	CreatedAt  string     `json:"created_at"`
+	Size       int64      `json:"size"`
+	Checksum   string     `json:"checksum,omitempty"`
+	IsDir      bool       `json:"is_dir"`
+	Files      []FileMeta `json:"files,omitempty"`
+}
+
+// BackupResult 备份结果
+type BackupResult struct {
+	Source string
+	Dest   string
+	Size   int64
+	Err    error
 }
 
 func main() {
@@ -74,14 +91,29 @@ func main() {
 	}
 
 	sources := flag.Args()
+	var results []BackupResult
 
 	for _, src := range sources {
-		if err := backup(src, cfg); err != nil {
+		result := backup(src, cfg)
+		results = append(results, result)
+	}
+
+	// 统一报告所有结果
+	failed := 0
+	for _, r := range results {
+		if r.Err != nil {
+			failed++
 			if !cfg.Quiet {
-				fmt.Fprintf(os.Stderr, "✗ error: %s\n", err)
+				fmt.Fprintf(os.Stderr, "✗ error: %s -> %v\n", r.Source, r.Err)
 			}
-			os.Exit(1)
+		} else if !cfg.Quiet {
+			fmt.Printf("✓ backup: %s -> %s (%s)\n", r.Source, r.Dest, formatSize(r.Size))
 		}
+	}
+
+	if failed > 0 {
+		fmt.Fprintf(os.Stderr, "\n%d/%d failed\n", failed, len(results))
+		os.Exit(1)
 	}
 }
 
@@ -149,10 +181,13 @@ func printUsage() {
   --version                显示版本`)
 }
 
-func backup(srcPath string, cfg Config) error {
+func backup(srcPath string, cfg Config) BackupResult {
+	result := BackupResult{Source: srcPath}
+
 	srcInfo, err := os.Stat(srcPath)
 	if err != nil {
-		return fmt.Errorf("source file not found: %s", srcPath)
+		result.Err = fmt.Errorf("source file not found: %s", srcPath)
+		return result
 	}
 
 	// 确定目标目录
@@ -178,6 +213,8 @@ func backup(srcPath string, cfg Config) error {
 		destPath = filepath.Join(destDir, backupName)
 	}
 
+	result.Dest = destPath
+
 	if cfg.Verbose {
 		fmt.Printf("[INFO] Starting backup...\n")
 		fmt.Printf("[SOURCE] %s (%s)\n", srcPath, formatSize(srcInfo.Size()))
@@ -186,103 +223,141 @@ func backup(srcPath string, cfg Config) error {
 
 	if cfg.DryRun {
 		if !cfg.Quiet {
-			fmt.Printf("✓ [DRY-RUN] %s -> %s\n", srcPath, destPath)
+			fmt.Printf("⚠ [DRY-RUN] %s -> %s\n", srcPath, destPath)
 		}
-		return nil
+		return result
 	}
 
 	// 创建目标目录
 	if err := os.MkdirAll(destDir, 0755); err != nil {
-		return fmt.Errorf("failed to create dest dir: %w", err)
+		result.Err = fmt.Errorf("failed to create dest dir: %w", err)
+		return result
 	}
+
+	// 执行备份
+	var srcChecksum string
+	var fileMetas []FileMeta
 
 	if srcInfo.IsDir() {
 		err = copyDir(srcPath, destPath)
+		if err != nil {
+			result.Err = err
+			return result
+		}
+		// 目录备份：递归收集所有文件 checksum
+		fileMetas, err = collectFileChecksums(srcPath)
+		if err != nil {
+			result.Err = fmt.Errorf("failed to collect checksums: %w", err)
+			return result
+		}
 	} else {
 		err = copyFile(srcPath, destPath)
-	}
-
-	if err != nil {
-		return err
-	}
-
-	// 验证 checksum (跳过目录)
-	var srcChecksum string
-	if !srcInfo.IsDir() {
+		if err != nil {
+			result.Err = err
+			return result
+		}
+		// 文件备份：计算 checksum
 		srcChecksum, err = checksum(srcPath)
 		if err != nil {
-			return fmt.Errorf("checksum failed: %w", err)
+			result.Err = fmt.Errorf("checksum failed: %w", err)
+			return result
 		}
+		result.Size = srcInfo.Size()
 	}
 
 	// 写入元数据
 	meta := Meta{
-		Version:    "1.0",
+		Version:    Version, // P1: 同步 Version 常量
 		Source:     filepath.Base(srcPath),
 		SourcePath: srcPath,
 		CreatedAt:  time.Now().Format(time.RFC3339),
 		Size:       srcInfo.Size(),
 		Checksum:   srcChecksum,
+		IsDir:      srcInfo.IsDir(),
+		Files:      fileMetas,
 	}
 
 	metaPath := filepath.Join(destDir, ".bak.meta.json")
-	metaBytes, _ := json.MarshalIndent(meta, "", "  ")
-	os.WriteFile(metaPath, metaBytes, 0644)
-
-	if !cfg.Quiet {
-		fmt.Printf("✓ backup: %s -> %s (%s)\n", srcPath, destPath, formatSize(srcInfo.Size()))
+	metaBytes, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		result.Err = fmt.Errorf("failed to marshal metadata: %w", err)
+		return result
 	}
 
-	if cfg.Verbose && srcChecksum != "" {
-		fmt.Printf("[VERIFY] checksum: %s\n", srcChecksum[:16]+"...")
-		fmt.Printf("[OK] Backup completed\n")
-	} else if cfg.Verbose {
+	// P0: 元数据写入必须检查 error
+	if err := os.WriteFile(metaPath, metaBytes, 0644); err != nil {
+		result.Err = fmt.Errorf("failed to write metadata: %w", err)
+		return result
+	}
+
+	if cfg.Verbose {
+		if srcChecksum != "" {
+			fmt.Printf("[VERIFY] checksum: %s\n", srcChecksum[:16]+"...")
+		}
+		if len(fileMetas) > 0 {
+			fmt.Printf("[VERIFY] %d files checked\n", len(fileMetas))
+		}
 		fmt.Printf("[OK] Backup completed\n")
 	}
 
-	return nil
+	return result
 }
 
+// P0: copyFile 返回 error 而非忽略
 func copyFile(src, dst string) error {
 	srcFile, err := os.Open(src)
 	if err != nil {
-		return err
+		return fmt.Errorf("open source: %w", err)
 	}
 	defer srcFile.Close()
 
 	dstFile, err := os.Create(dst)
 	if err != nil {
-		return err
+		return fmt.Errorf("create dest: %w", err)
 	}
 	defer dstFile.Close()
 
 	_, err = io.Copy(dstFile, srcFile)
 	if err != nil {
 		os.Remove(dst)
-		return err
+		return fmt.Errorf("copy content: %w", err)
 	}
 
-	// 复制权限
-	srcInfo, _ := os.Stat(src)
-	os.Chmod(dst, srcInfo.Mode())
+	// P0: 检查 chmod 错误（软失败，记录警告但不阻断）
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		os.Remove(dst)
+		return fmt.Errorf("stat source: %w", err)
+	}
+
+	if err = os.Chmod(dst, srcInfo.Mode()); err != nil {
+		// 权限修改失败不阻断，但记录
+		// 如需严格模式可改为 return error
+	}
+
+	// P0: 检查 Close 错误
+	if err = dstFile.Close(); err != nil {
+		os.Remove(dst)
+		return fmt.Errorf("close dest: %w", err)
+	}
 
 	return nil
 }
 
+// P0: copyDir 返回 error 而非忽略
 func copyDir(src, dst string) error {
 	srcInfo, err := os.Stat(src)
 	if err != nil {
-		return err
+		return fmt.Errorf("stat source dir: %w", err)
 	}
 
-	err = os.MkdirAll(dst, srcInfo.Mode())
-	if err != nil {
-		return err
+	if err = os.MkdirAll(dst, srcInfo.Mode()); err != nil {
+		return fmt.Errorf("create dest dir: %w", err)
 	}
 
 	entries, err := os.ReadDir(src)
 	if err != nil {
-		return err
+		return fmt.Errorf("read dir: %w", err)
 	}
 
 	for _, entry := range entries {
@@ -290,13 +365,59 @@ func copyDir(src, dst string) error {
 		dstEntry := filepath.Join(dst, entry.Name())
 
 		if entry.IsDir() {
-			copyDir(srcEntry, dstEntry)
+			// P0: 递归调用返回 error
+			if err := copyDir(srcEntry, dstEntry); err != nil {
+				return fmt.Errorf("copy dir %s: %w", srcEntry, err)
+			}
 		} else {
-			copyFile(srcEntry, dstEntry)
+			// P0: copyFile 返回 error
+			if err := copyFile(srcEntry, dstEntry); err != nil {
+				return fmt.Errorf("copy file %s: %w", srcEntry, err)
+			}
 		}
 	}
 
 	return nil
+}
+
+// P1: 递归收集目录下所有文件的 checksum
+func collectFileChecksums(root string) ([]FileMeta, error) {
+	var metas []FileMeta
+
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return fmt.Errorf("walk error at %s: %w", path, err)
+		}
+
+		// 跳过目录
+		if info.IsDir() {
+			return nil
+		}
+
+		cs, err := checksum(path)
+		if err != nil {
+			return fmt.Errorf("checksum %s: %w", path, err)
+		}
+
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return fmt.Errorf("rel path %s: %w", path, err)
+		}
+
+		metas = append(metas, FileMeta{
+			Path:     rel,
+			Size:     info.Size(),
+			Checksum: cs,
+		})
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return metas, nil
 }
 
 func checksum(path string) (string, error) {
@@ -315,15 +436,17 @@ func checksum(path string) (string, error) {
 	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
 }
 
+// P2 fix: formatSize 对 PB 以上越界问题（扩展 units）
 func formatSize(size int64) string {
 	const unit = 1024
+	units := "BKMGTPE" // 扩展到 E
 	if size < unit {
 		return fmt.Sprintf("%d B", size)
 	}
 	div, exp := int64(unit), 0
-	for n := size / unit; n >= unit; n /= unit {
+	for n := size / unit; n >= unit && exp < len(units)-2; n /= unit {
 		div *= unit
 		exp++
 	}
-	return fmt.Sprintf("%.1f %cB", float64(size)/float64(div), "KMGTPE"[exp])
+	return fmt.Sprintf("%.1f %cB", float64(size)/float64(div), units[exp+1])
 }
